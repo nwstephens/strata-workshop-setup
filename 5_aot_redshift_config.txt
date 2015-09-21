@@ -1,0 +1,42 @@
+### STRATA Infrastructure ###
+
+### Redshift Config ###
+
+# Create group
+
+psql -h strata1.cjku7otn8uia.us-west-2.redshift.amazonaws.com -U nathan -d mydb -p 5439 \
+  -c 'create group guests'
+
+# Create Users
+
+redshiftusers=/home/ubuntu/redshift-users.sql
+
+rm -f $redshiftusers
+
+for i in {1001..1150}
+  do
+    echo "create user guest$i password ‘XXXXXXXX’ in group guests;"
+  done >> $redshiftusers
+
+psql -h strata1.cjku7otn8uia.us-west-2.redshift.amazonaws.com -U nathan -d mydb -p 5439 \
+  -f $redshiftusers
+
+# Privileges
+
+redshiftprivileges=/home/ubuntu/redshift-privileges.sql
+
+echo "
+  revoke all on schema public from public;
+  revoke all on schema public from group guests;
+  revoke all on all tables in schema public from public;
+  revoke all on all tables in schema public from guests;
+  grant usage on schema public to public;
+  grant usage on schema public to group guests;
+  grant select on all tables in schema public to public;
+  grant select on all tables in schema public to group guests;  
+" > $redshiftprivileges
+
+psql -h strata1.cjku7otn8uia.us-west-2.redshift.amazonaws.com -U nathan -d mydb -p 5439 \
+  -f $redshiftprivileges
+
+

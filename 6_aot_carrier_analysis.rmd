@@ -1,0 +1,346 @@
+---
+title: "Analysis of Air On Time Data"
+output: html_document
+params:
+   query1_frac: 0.01
+   query2_frac: 0.10
+author: Nathan Stephens, Director of Solutions Engineering at RStudio
+date: Sep 29, 2015
+---
+
+***
+
+## Abstract
+Is there evidence to suggest that **some airline carriers gain time once their flight is delayed**? An official flight delay is one that departs more than 15 minutes after the scheduled departure time. This analysis compares the time gain (i.e the difference between scheduled flight time and actual flight time) for delayed flights against various predictors. A simplistic linear model suggests that longer travel distances are associated to higher gains and that a few specific carriers are associated with higher gains.
+
+This analysis depends on data stored in a database, specifically Amazon's cloud-based **Redshift** data warehouse. Furthermore this script relies on **dplyr** to connect to the data warehouse and to translate commands into postgresql. For more details on Amazon Redshift or dplyr, please refer to the [appendix](#appendix) at the bottom of this page.
+
+The **Air On Time** data consist of flight arrival and departure details for all commercial flights within the USA, from October 1987 to April 2008. There are nearly 120 million records in total, and takes up 1.6 gigabytes of space compressed and 12 gigabytes when uncompressed. The data source can be found [here](http://stat-computing.org/dataexpo/2009/the-data.html). 
+
+Markus Schmidberger wrote a **guide for uploading** the Air On Time data into a Redshift database. For more information see his post on the AWS Big Data Blog titled [Connecting R With Amazon Redshift](https://blogs.aws.amazon.com/bigdata/post/Tx1G8828SPGX3PK/Connecting-R-with-Amazon-Redshift).
+
+***
+
+## Setup
+
+#### Package dependencies
+
+```{r, results='hide', message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(dygraphs)
+library(xts)
+library(DT)
+library(gridExtra)
+```
+
+```{r echo=FALSE}
+#params <- list(query1_frac=0.01, query2_frac=0.10)
+```
+
+#### Connect to the database
+
+```{r}
+(air <- src_postgres(dbname = Sys.getenv('dbname'), 
+                    host = Sys.getenv('host'), 
+                    port = Sys.getenv('port'), 
+                    user = Sys.getenv('user'), 
+                    password = Sys.getenv('password')))
+```
+
+#### Connect to the flights fact table
+
+```{r}
+flights <- tbl(air, "flights")
+colnames(flights)
+```
+
+#### Connect to the carrier lookup table
+```{r}
+carriers <- tbl(air, "carriers")
+glimpse(carriers)
+```
+
+***
+
+## Exploratory Data Analysis
+
+Before building the model, we need to get familiar with the data. We will conduct a brief exploratory data analysis on a small subset of the data. 
+
+We can reduce our data by extracting a subset of columns and rows. There are **`r prettyNum(nrow(flights),",")`** records in the database. We desire to extract a **`r sprintf("%1.0f%%", 100 * params$query1_frac)`** sample so that we can explore patterns in the data prior to building a predictive model. We pull only the columns that we believe are useful in the analysis.
+
+We draw the sample by creating random numbers for all records in the database, then taking any random number that is less than **`r sprintf("%1.0f%%", 100 * params$query1_frac)`**.
+
+We will also create our target variable, "gain", which is the difference between departure delay and arrival delay. A positive gain means that the duration of the plane flight was **shorter** than expected. Conversely, a negative gain means that the duration of the plane flight was **longer** than expected.
+
+```{r, eval = T}
+query1 <- flights %>%
+  select(year, month, arrdelay, depdelay, distance, uniquecarrier) %>%
+  mutate(gain = depdelay - arrdelay) %>%
+  mutate(x = random()) %>%
+  collapse() %>%
+  filter(x < params$query1_frac)
+samp1 <- collect(query1)
+show_query(query1)
+```
+
+The sample data has **`r prettyNum(nrow(samp1),",")`** rows and **`r ncol(samp1)`** columns. These sample data will be used to conduct an exploratory data analysis.
+
+#### 1. Filter NA's
+
+NA's (i.e. missing values) are a constant nuisance in analyses. We will throw out any record containing an NA.
+
+```{r}
+apply(is.na(samp1), 2, sum)
+samp2 <- samp1 %>%
+  filter(!is.na(arrdelay) & !is.na(depdelay) & !is.na(distance))
+```
+
+#### 2. Filter outliers
+
+An official delay is one that is at least 15 minutes. We will filter all records with delays under 15 minutes. Both departure and arrival delays are heavily skewed with outliers at both extremes. We will arbitrarily limit our analysis to departure delays between +15 minutes and +4 hours, and arrival delays between -1 hour and +6 hours.
+
+```{r, fig.width=12, fig.height=4, warning = FALSE}
+p1 <- ggplot(samp2, aes(depdelay)) + 
+  geom_density(fill = "lightblue") + 
+  geom_vline(xintercept = c(15, 240), col = 'tomato') + 
+  xlim(-15, 240)
+
+p2 <- ggplot(samp2, aes(depdelay, arrdelay)) + 
+  geom_hex() +
+  geom_vline(xintercept = c(15, 240), col = 'tomato') +
+  geom_hline(yintercept = c(-60, 360), col = 'tomato')
+
+grid.arrange(p1, p2, ncol=2)
+
+samp3 <- samp2 %>%
+  filter(depdelay > 15 & depdelay < 240) %>%
+  filter(arrdelay > -60 & arrdelay < 360)
+```
+
+#### 3. Filter years
+
+We don't need to examine every year in the data to build a good model. In fact, more data can often be worse. Gains changed drastically after 9/11. We will pull data only from 2003 to 2007. We will leave 2008 as our forecast (i.e. test) year.
+
+```{r, fig.width=8, fig.height=4}
+samp3_by_year <- samp3 %>%
+  group_by(year) %>%
+  summarize(gain = mean(gain)) %>%
+  mutate(year = as.Date(paste(year, '01-01', sep = '-')))
+
+with(samp3_by_year, as.xts(gain, year)) %>% 
+  dygraph(main = "Gain") %>%
+  dyShading("2003-01-01", "2007-01-01") %>%
+  dyRangeSelector()
+
+samp4 <- samp3 %>%
+  filter(year >= 2003 & year <= 2007)
+```
+
+#### 4. Join carrier description
+
+The carrier table maps carrier codes to carrier descriptions. For example, the carrier code, "NW" maps to "Southwest Airlines". This table will be useful for interpreting our data.
+
+Even without building a model we can see which airlines have the largest average gains in our sampled data. Notice that we are extract the carrier table using the "copy = TRUE" option in the "left_join" function. Small tables can easily be extracted from or copied to the database using this feature.
+
+```{r, fig.height=5, fig.width=7}
+samp5 <- samp4 %>% 
+  left_join(carriers, by = c('uniquecarrier' = 'code'), copy = TRUE) %>%
+  mutate(description = substr(description, 1, 25))
+
+samp5 %>% 
+  group_by(description) %>% 
+  summarise(gain = mean(gain)) %>% 
+  ggplot(aes(gain, reorder(description, gain))) + 
+  geom_point() +
+  labs(title = 'Gain', x = 'Minutes', y = '')
+```
+
+***
+
+## Train and Validate Model
+
+We will build a simplistic linear model to explain and predict time gains. We will predict gain as a function of flight distance, departure delay, and carrier. We are interested to know if certain carriers show positive gains.
+
+##### Extract sample data
+
+Using the filtering criteria derived in the exploratory data analysis, we pull a new random sample. We split this sample into two equal sizes for training and validating the model.
+
+```{r, eval = T}
+query2 <- flights %>%
+  select(year, month, arrdelay, depdelay, distance, uniquecarrier) %>%
+  filter(!is.na(arrdelay) & !is.na(depdelay) & !is.na(distance)) %>%
+  filter(depdelay > 15 & depdelay < 240) %>%
+  filter(arrdelay > -60 & arrdelay < 360) %>%
+  filter(year >= 2003 & year <= 2007) %>%
+  mutate(x = random()) %>%
+  collapse() %>%
+  filter(x < params$query2_frac) %>%
+  left_join(carriers, by = c("uniquecarrier" = "code")) %>%
+  mutate(gain = depdelay - arrdelay) %>%
+  mutate(data = if(x < params$query2_frac / 2) 'train' else 'valid') %>%
+  select(-x)
+samp2 <- collect(query2)
+
+samp2 <- mutate(samp2, uniquecarrier = factor(uniquecarrier))
+train1 <- filter(samp2, data == 'train')
+valid1 <- filter(samp2, data == 'valid')
+
+show_query(query2)
+```
+
+The training data has **`r prettyNum(nrow(train1),",")`** rows and **`r ncol(train1)`** columns. The validation data has **`r prettyNum(nrow(valid1),",")`** rows and **`r ncol(valid1)`** columns.
+
+#### Build model
+
+We build a simplistic model to explain gain. Distance and departure delays are slopes (i.e. quantitative) and carrier is an intercept (i.e. qualitative). Much more sophisticated models with more complex structures would outperform this model.
+
+```{r}
+lm1 <- lm(gain ~ distance + depdelay + uniquecarrier, train1)
+```
+
+The F-value in the analysis of variance tells us that distance is highly significant. And that every additional mile in flight results in a slight time savings. Longer flights have a greater opportunity to make up time. The ANOVA also tells us that departure delay and carrier are also significant, but not as impactful as distance. 
+
+```{r}
+anova(lm1)
+```
+
+The table of coefficients tell us which carriers are most significant and whether their effects are positive or negative. Notice that not all carriers have significant effects. However, some carriers significantly outperform others. For example, WN (Southwest) and AS (Alaska) make up time, whereas DL (Delta) and AA (American) do the opposite.
+
+```{r}
+data.frame(round(summary(lm1)$coefficients, 4)) %>%
+  add_rownames() %>%
+  mutate(code = substring(rowname, 14)) %>%
+  left_join(carriers, copy = TRUE) %>%
+  select(rowname, description, Estimate, Std..Error, t.value, Pr...t..) %>%
+  datatable()
+```
+
+#### Assess model fit
+
+A quick examination of model residuals and fit statistics reveals that the model is under specified. Residuals are bell shaped, but not normally distributed (i.e. skewed). The r-squared value of **`r summary(lm1)$r.squared`** is evidence that this model only explains a small percentage of the overall variation we see in the data.
+
+```{r, fig.width=8, fig.height=3, warning=FALSE}
+train1 <- mutate(train1, resid = resid(lm1), pred = predict(lm1))
+ind <- sample.int(nrow(lm1$model), 10000)
+p3 <- qplot(resid, pred, data = train1[ind,], geom = 'hex', main = 'Fitted vs Residuals')
+p5 <- qplot(sample = resid, data = train1[ind,], stat = 'qq', main = 'Residuals QQ Plot')
+grid.arrange(p3, p5, ncol=2)
+```
+
+#### Validate the model
+
+Fortunately, the model performance for the validation data is similar to the performance for the training data. We did not regularize the model, but it seems to predict fairly well against the validation data. The RMSE is similar, and the performance by predicted decile is similar.
+
+```{r, fig.width=8, fig.height=3}
+p6 <- data.frame(
+  data = c('train', 'valid'),
+  rmse = sqrt(c(mean(train1$resid^2), mean((valid1$gain - predict(lm1, valid1))^2)))
+  ) %>%
+  ggplot(aes(data, rmse, fill=data)) + 
+  geom_bar(stat='identity') +
+  labs(title='RMSE', x = '', y = 'Minutes')
+
+p7 <- samp2 %>%
+  mutate(pred = predict(lm1, samp2)) %>%
+  mutate(decile = ntile(pred, 10)) %>%
+  group_by(data, decile) %>%
+  summarize(gain = mean(gain)) %>%
+  collect() %>%
+  ggplot(aes(factor(decile), gain, fill = data)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  labs(title = 'Average gain by predicted decile', x = 'Decile', y = 'Minutes')
+
+grid.arrange(p6, p7, ncol = 2)
+```
+
+***
+
+## Forecast
+
+We now wish to assess our predictions on future data. We want to use our carrier model to make predictions on "out of time" data. We will use the model scores to score **all of the 2008 data in the database** and then select the top performers. We will then summarize the top performers by carrier. 
+
+We will use dplyr syntax to create SQL code using the follow this process.
+
+1. Copy the model scores into the database
+2. Score every record in 2008
+3. Calculate deciles using window functions
+4. Select the top decile
+5. Summarize the performance by carrier
+
+#### Coefficient lookup table
+
+Some data manipulation is required to translate the model scores into a look up table. This lookup table will be copied to the database using the "left_join" function and the "copy" option.
+
+```{r}
+coefs <- dummy.coef(lm1)
+k <- length(coefs$uniquecarrier)
+coefs_lkp <- data.frame(
+  uniquecarrier = names(coefs$uniquecarrier),
+  carrier_score = coefs$uniquecarrier,
+  int_score = rep(coefs$`(Intercept)`, k),
+  dist_score = rep(coefs$distance, k),
+  delay_score = rep(coefs$depdelay, k),
+  row.names = NULL, 
+  stringsAsFactors = FALSE
+)
+head(coefs_lkp)
+```
+
+#### Score the database forecast performance
+
+Here we can see the average carrier gains for the top decile. We can see that they are not in the same order as the model effects. But we can see that there is significant variation between the top and bottom performing airlines even within the top performers.
+
+```{r, fig.width=6, fig.height=4, warning=FALSE, message=FALSE}
+samp3 <- flights %>%
+  select(year, month, arrdelay, depdelay, distance, uniquecarrier) %>%
+  filter(!is.na(arrdelay) & !is.na(depdelay) & !is.na(distance)) %>%
+  filter(depdelay > 15 & depdelay < 240) %>%
+  filter(arrdelay > -60 & arrdelay < 360) %>%
+  filter(year == 2008) %>%
+  mutate(gain = depdelay - arrdelay) %>%
+  left_join(coefs_lkp, copy = TRUE) %>%
+  left_join(carriers, by = c('uniquecarrier' = 'code')) %>%
+  mutate(pred = int_score + carrier_score + dist_score * distance + delay_score * depdelay) %>%
+  mutate(decile = ntile(gain, 10L)) %>%
+  filter(decile == 10L) %>%
+  group_by(description) %>%
+  summarize(gain = mean(1.0 * gain)) %>%
+  collect()
+
+ggplot(samp3, aes(reorder(substr(description, 1, 25), gain), gain)) +
+  geom_bar(stat = 'Identity', fill = 'salmon') +
+  coord_flip() +
+  labs(title = 'Average carrier gains for top decile', x = '', y = '')
+
+```
+
+***
+
+## Summary
+
+The objective of our analysis was to investigate whether certain carriers gained time after a departure delay. We built a simplistic linear model against a subset of the data and then validated the model against a hold out group. Finally, we assessed the model against an out of time sample within the database.
+
+We found that distance was the most significant predictor of gained time. The longer the flight, the more time gained. We also found that carrier effects were significant, but less so than distance. Certain carriers had significant positive effects, **which was evidence that some carriers gain time after a departure delay**.
+
+This model included only a few predictors and used a simple form. More sophisticated models using more predictors (e.g. adjusting for weather) might lead to more conclusive results. However, given the weak fit of this model the level of opportunity is questionable.
+
+Benjamine Montet analyzed a similar data set with fewer carriers and fewer flights in [this FiveThirtyEight.com blog post](http://fivethirtyeight.com/features/flight-delayed-your-pilot-really-can-make-up-the-time-in-the-air/). He found that carriers do indeed make up small gains on some delayed flights, but did not find any significant differences between select carriers. In his [blog post on Slate.com](http://www.slate.com/articles/life/explainer/2011/11/pilots_making_up_time_during_a_flight_is_it_real_.html), Bryan Lowder makes the point that airlines tend to make up only a few minutes due to flight rules and fuel economics.
+
+***
+
+## Appendix
+
+#### Amazon Redshift
+
+Amazon Redshift is a fully managed, petabyte-scale data warehouse service in the cloud. It is built on top of technology from the massive parallel processing (MPP) data warehouse ParAccel by Actian. Redshift differs from Amazon's other hosted database offering, Amazon RDS, by being able to handle analytics workloads on large scale datasets stored by a column-oriented DBMS principle.
+
+An Amazon Redshift cluster is a set of nodes, which consists of a leader node and one or more compute nodes. The type and number of compute nodes that you need depends on the size of your data, the number of queries you will execute, and the query execution performance that you need.
+
+Amazon Redshift is specifically designed for online analytic processing (OLAP) and business intelligence (BI) applications, which require complex queries against large datasets. Because it addresses very different requirements, the specialized data storage schema and query execution engine that Amazon Redshift uses are completely different from the PostgreSQL implementation. For example, where online transaction processing (OLTP) applications typically store data in rows, Amazon Redshift stores data in columns, using specialized data compression encodings for optimum memory usage and disk I/O. Some PostgreSQL features that are suited to smaller-scale OLTP processing, such as secondary indexes and efficient single-row data manipulation operations, have been omitted to improve performance.
+
+#### dplyr
+As well as working with local in-memory data like data frames and data tables, dplyr also works with remote on-disk data stored in databases. Generally, if your data fits in memory there is no advantage to putting it in a database: it will only be slower and more hassle. The reason you’d want to use dplyr with a database is because either your data is already in a database (and you don’t want to work with static CSV files that someone else has dumped out for you), or you have so much data that it does not fit in memory and you have to use a database. Currently dplyr supports the three most popular open source databases (SQLite, MySQL and postgresql), and Google’s BigQuery. See more information [here](https://cran.r-project.org/web/packages/dplyr/vignettes/databases.html).
+
+
+

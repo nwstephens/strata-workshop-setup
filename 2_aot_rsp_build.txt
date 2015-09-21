@@ -1,0 +1,112 @@
+### STRATA Infrastructure ###
+
+### Server Build ###
+
+# Add group
+
+sudo groupadd -g 800 guests
+sudo groupadd -g 801 rstudio-superuser-admins
+sudo groupadd -g 802 admins
+
+# Add admin admin
+
+sudo useradd -u 2000 -m -g admins admin 
+sudo passwd admin
+sudo sed -i '21iadmin ALL=(ALL:ALL) ALL' /etc/sudoers
+sudo usermod -a -G rstudio-superuser-admins admin
+
+# Create users
+
+guestlist=~/batch-guest-list.txt
+
+rm -f $guestlist
+
+for i in {1001..1150}
+  do
+    echo "guest$i:XXXXXXXX:$i:800:RStudioStrata2015:/home/guest$i:/bin/bash"
+  done > $guestlist
+
+sudo newusers $guestlist
+
+# Create .Rprofile
+
+for i in {1001..1150}
+  do
+    user=guest$i
+    fnam=/home/$user/.Rprofile
+    echo "
+
+      Sys.setenv(dbname = 'mydb')
+      Sys.setenv(host = 'strata1.cjku7otn8uia.us-west-2.redshift.amazonaws.com')
+      Sys.setenv(port = '5439')
+      Sys.setenv(user = '$user')
+      Sys.setenv(password = ‘XXXXXXXX’)
+
+
+    " > $fnam
+    chmod 644 $fnam
+    chown $user:guests $fnam
+  done
+
+# Enable epel
+
+sudo sed -i '10ideb https://cran.rstudio.com/bin/linux/ubuntu trusty/' /etc/apt/sources.list
+
+# Install Dependencies
+
+sudo apt-get install libpq-dev   
+sudo apt-get install gdebi-core
+sudo apt-get install texlive
+sudo apt-get install texlive-latex-extra
+
+# Install R
+
+sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys E084DAB9
+sudo apt-get update
+sudo apt-get install r-base
+sudo apt-get install postgresql-client
+
+# Install Packages
+
+sudo R -e 'install.packages("dplyr", "/usr/lib/R/library", "https://cran.rstudio.com")'
+sudo R -e 'install.packages("RPostgreSQL", "/usr/lib/R/library", "https://cran.rstudio.com")'
+sudo R -e 'install.packages("rmarkdown", "/usr/lib/R/library", "https://cran.rstudio.com")'
+sudo R -e 'install.packages("shiny", "/usr/lib/R/library", "https://cran.rstudio.com")'
+sudo R -e 'install.packages("RJSONIO", "/usr/lib/R/library", "https://cran.rstudio.com")'
+sudo R -e 'install.packages("ggplot2", "/usr/lib/R/library", "https://cran.rstudio.com")'
+sudo R -e 'install.packages("dygraphs", "/usr/lib/R/library", "https://cran.rstudio.com")'
+sudo R -e 'install.packages("xts", "/usr/lib/R/library", "https://cran.rstudio.com")'
+sudo R -e 'install.packages("DT", "/usr/lib/R/library", "https://cran.rstudio.com")'
+sudo R -e 'install.packages("gridExtra", "/usr/lib/R/library", "https://cran.rstudio.com")'
+sudo R -e 'install.packages("hexbin", "/usr/lib/R/library", "https://cran.rstudio.com")'
+
+# Install RSP
+
+sudo wget -P /tmp https://download2.rstudio.org/rstudio-server-pro-0.99.484-amd64.deb
+sudo gdebi /tmp/rstudio-server-pro-0.99.484-amd64.deb
+sudo rstudio-server license-manager activate XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX
+sudo rstudio-server restart
+
+# Configure RSP
+
+echo "# Server Configuration File
+admin-enabled=1
+admin-group=guests
+admin-superuser-group=rstudio-superuser-admins" | 
+sudo tee /etc/rstudio/rserver.conf > /dev/null
+
+echo "#R Profiles File
+[@guests]
+max-memory-mb = 5120
+max-processes = 100" |
+sudo tee /etc/rstudio/profiles > /dev/null
+
+echo "# R Session Configuration File
+r-libs-user=~/R/library
+session-save-action-default=no
+session-timeout-minutes=30
+limit-cpu-time-minutes=15" |
+sudo tee /etc/rstudio/rsession.conf > /dev/null
+
+sudo rstudio-server restart
+
